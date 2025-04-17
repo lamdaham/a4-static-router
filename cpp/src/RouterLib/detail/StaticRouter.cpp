@@ -109,8 +109,10 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
                     memcpy(tmp.data(), eth->ether_shost, ETHER_ADDR_LEN);
                     memcpy(eth->ether_shost, eth->ether_dhost, ETHER_ADDR_LEN);
                     memcpy(eth->ether_dhost, tmp.data(),         ETHER_ADDR_LEN);
-                    // swap IPs
-                    std::swap(ip->ip_src, ip->ip_dst);
+                    // swap IPs using a temporary variable (instead of std::swap)
+                    uint32_t tmp_ip = ip->ip_src;
+                    ip->ip_src = ip->ip_dst;
+                    ip->ip_dst = tmp_ip;
                     ip->ip_ttl = 64;
                     ip->ip_sum = 0;
                     ip->ip_sum = cksum(ip, ip->ip_hl * 4);
