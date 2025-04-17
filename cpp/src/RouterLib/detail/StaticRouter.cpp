@@ -29,11 +29,50 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
     uint16_t etherType = ntohs(eth_hdr->ether_type);
 
     if (etherType == ethertype_arp) {
-        // --- ARP packet processing ---
-        spdlog::info("Received ARP packet.");
-        // Here you would check if the ARP request is meant for one of your router’s IPs
-        // and, if so, construct and send an appropriate ARP reply.
-        // You may also update the ARP cache if you receive a valid ARP reply.
+        auto *arp_hdr = reinterpret_cast<sr_arp_hdr_t*>(
+            packet.data() + sizeof(sr_ethernet_hdr_t));
+
+        uint16_t op = ntohs(arp_hdr->ar_op);
+        uint32_t sip = ntohl(arp_hdr->ar_sip);
+        uint32_t tip = ntohl(arp_hdr->ar_tip);
+
+        // Look up our interface info for this ingress iface
+        auto ifaceInfo = routingTable->getRoutingInterface(iface);
+
+        if (op == arp_op_request && tip == ifaceInfo.ip) {
+            // Build ARP reply packet
+            Packet reply(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
+            auto *eth = reinterpret_cast<sr_ethernet_hdr_t*>(reply.data());
+            auto *rarp = reinterpret_cast<sr_arp_hdr_t*>(reply.data() + sizeof(*eth));
+
+            // Ethernet header: swap src/dst
+            memcpy(eth->ether_dhost, eth_hdr->ether_shost, ETHER_ADDR_LEN);
+            memcpy(eth->ether_shost, ifaceInfo.mac.data(), ETHER_ADDR_LEN);
+            eth->ether_type = htons(ethertype_arp);
+
+            // ARP header
+            rarp->ar_hrd = htons(arp_hrd_ethernet);
+            rarp->ar_pro = htons(ethertype_ip);
+            rarp->ar_hln = ETHER_ADDR_LEN;
+            rarp->ar_pln = 4;
+            rarp->ar_op  = htons(arp_op_reply);
+            // our MAC/IP as sender
+            memcpy(rarp->ar_sha, ifaceInfo.mac.data(), ETHER_ADDR_LEN);
+            rarp->ar_sip = htonl(ifaceInfo.ip);
+            // original requester as target
+            memcpy(rarp->ar_tha, arp_hdr->ar_sha, ETHER_ADDR_LEN);
+            rarp->ar_tip = htonl(sip);
+
+            packetSender->sendPacket(reply, iface);
+            return;
+        }
+        else if (op == arp_op_reply) {
+            // learn the mapping and wake any queued packets
+            mac_addr mac;
+            memcpy(mac.data(), arp_hdr->ar_sha, ETHER_ADDR_LEN);
+            arpCache->addEntry(ntohl(arp_hdr->ar_sip), mac);
+            return;
+        }
         return;
     }
     else if (etherType == ethertype_ip) {
