@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 #include <cstring>
+#include <algorithm>
 
 #include "protocol.h"
 #include "utils.h"
@@ -18,188 +19,242 @@ StaticRouter::StaticRouter(
 void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) {
     std::unique_lock lock(mutex);
 
-    // Must have at least an Ethernet header
+    // 1) Ethernet header present?
     if (packet.size() < sizeof(sr_ethernet_hdr_t)) {
         spdlog::error("Packet too small for Ethernet header");
         return;
     }
+    auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(packet.data());
+    uint16_t ethtype = ntohs(eth->ether_type);
 
-    auto *eth_hdr = reinterpret_cast<sr_ethernet_hdr_t*>(packet.data());
-    uint16_t etherType = ntohs(eth_hdr->ether_type);
-
-    //
     // --- ARP Handling ---
-    //
-    if (etherType == ethertype_arp) {
-        auto *arp_hdr = reinterpret_cast<sr_arp_hdr_t*>(packet.data() + sizeof(sr_ethernet_hdr_t));
-        uint16_t op  = ntohs(arp_hdr->ar_op);
-        uint32_t sip = ntohl(arp_hdr->ar_sip);
-        uint32_t tip = ntohl(arp_hdr->ar_tip);
+    if (ethtype == ethertype_arp) {
+        auto* arp = reinterpret_cast<sr_arp_hdr_t*>(
+            packet.data() + sizeof(sr_ethernet_hdr_t));
+        uint16_t op  = ntohs(arp->ar_op);
+        uint32_t sip = ntohl(arp->ar_sip);
+        uint32_t tip = ntohl(arp->ar_tip);
 
-        // Loop over all router interfaces so we answer requests to any of our IPs (e.g., 10.0.1.1)
-        for (auto const& [ifName, ifInfo] : routingTable->getRoutingInterfaces()) {
-            if (op == arp_op_request && tip == ifInfo.ip) {
-                // Build ARP reply
-                std::vector<uint8_t> reply(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
-                auto *reth = reinterpret_cast<sr_ethernet_hdr_t*>(reply.data());
-                auto *rarp = reinterpret_cast<sr_arp_hdr_t*>(reply.data() + sizeof(sr_ethernet_hdr_t));
+        // Interface info for this ingress iface
+        auto ifInfo = routingTable->getRoutingInterface(iface);
 
-                // Ethernet header: swap src/dst, set type
-                std::memcpy(reth->ether_dhost, eth_hdr->ether_shost, ETHER_ADDR_LEN);
-                std::memcpy(reth->ether_shost, ifInfo.mac.data(),  ETHER_ADDR_LEN);
-                reth->ether_type = htons(ethertype_arp);
-
-                // ARP header
-                rarp->ar_hrd = htons(arp_hrd_ethernet);
-                rarp->ar_pro = htons(ethertype_ip);
-                rarp->ar_hln = ETHER_ADDR_LEN;
-                rarp->ar_pln = 4;
-                rarp->ar_op  = htons(arp_op_reply);
-
-                // Our MAC/IP as sender
-                std::memcpy(rarp->ar_sha, ifInfo.mac.data(), ETHER_ADDR_LEN);
-                rarp->ar_sip = htonl(ifInfo.ip);
-                // Original requester as target
-                std::memcpy(rarp->ar_tha, arp_hdr->ar_sha, ETHER_ADDR_LEN);
-                rarp->ar_tip = htonl(sip);
-
-                packetSender->sendPacket(reply, iface);
-                return;
-            }
-        }
-
-        // ARP Reply: learn the mapping and wake any queued packets
-        if (op == arp_op_reply) {
-            mac_addr mac;
-            std::memcpy(mac.data(), arp_hdr->ar_sha, ETHER_ADDR_LEN);
-            arpCache->addEntry(ntohl(arp_hdr->ar_sip), mac);
+        // (a) ARP request for our IP -> reply
+        if (op == arp_op_request && tip == ifInfo.ip) {
+            std::vector<uint8_t> reply(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
+            auto* reth = reinterpret_cast<sr_ethernet_hdr_t*>(reply.data());
+            auto* rarp = reinterpret_cast<sr_arp_hdr_t*>(
+                reply.data() + sizeof(sr_ethernet_hdr_t));
+            // Ethernet: dst=orig src=ours
+            memcpy(reth->ether_dhost, eth->ether_shost, ETHER_ADDR_LEN);
+            memcpy(reth->ether_shost, ifInfo.mac.data(),  ETHER_ADDR_LEN);
+            reth->ether_type = htons(ethertype_arp);
+            // ARP header
+            rarp->ar_hrd = htons(arp_hrd_ethernet);
+            rarp->ar_pro = htons(ethertype_ip);
+            rarp->ar_hln = ETHER_ADDR_LEN;
+            rarp->ar_pln = sizeof(uint32_t);
+            rarp->ar_op  = htons(arp_op_reply);
+            memcpy(rarp->ar_sha, ifInfo.mac.data(),            ETHER_ADDR_LEN);
+            rarp->ar_sip = htonl(ifInfo.ip);
+            memcpy(rarp->ar_tha, arp->ar_sha,                  ETHER_ADDR_LEN);
+            rarp->ar_tip = arp->ar_sip;
+            packetSender->sendPacket(reply, iface);
             return;
         }
-
+        // (b) ARP reply -> learn
+        if (op == arp_op_reply) {
+            mac_addr mac;
+            memcpy(mac.data(), arp->ar_sha, ETHER_ADDR_LEN);
+            arpCache->addEntry(ntohl(arp->ar_sip), mac);
+            return;
+        }
         return;
     }
 
-    //
     // --- IP Handling ---
-    //
-    if (etherType == ethertype_ip) {
-        // Must have full IP header
+    if (ethtype == ethertype_ip) {
         if (packet.size() < sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t)) {
-            spdlog::error("Packet too small for IP");
+            spdlog::error("Packet too small for IP header");
             return;
         }
-
-        auto *ip_hdr = reinterpret_cast<sr_ip_hdr_t*>(
+        auto* ip = reinterpret_cast<sr_ip_hdr_t*>(
             packet.data() + sizeof(sr_ethernet_hdr_t));
-
-        // Validate checksum
-        uint16_t orig_sum = ip_hdr->ip_sum;
-        ip_hdr->ip_sum = 0;
-        uint16_t calc_sum = cksum(ip_hdr, ip_hdr->ip_hl * 4);
-        if (calc_sum != orig_sum) {
-            spdlog::error("Bad IP checksum");
+        // verify checksum
+        uint16_t orig = ip->ip_sum;
+        ip->ip_sum = 0;
+        if (cksum(ip, ip->ip_hl * 4) != orig) {
+            spdlog::error("Invalid IP checksum");
             return;
         }
-        ip_hdr->ip_sum = orig_sum;
+        ip->ip_sum = orig;
 
-        // Is this destined for one of our interfaces?
-        bool forUs = false;
-        for (auto const& [name, ifaceInfo] : routingTable->getRoutingInterfaces()) {
-            if (ip_hdr->ip_dst == ifaceInfo.ip) {
-                forUs = true;
-                break;
-            }
+        // check if destined for us
+        bool toMe = false;
+        for (auto const& kv : routingTable->getRoutingInterfaces()) {
+            if (ip->ip_dst == kv.second.ip) { toMe = true; break; }
         }
-
-        if (forUs) {
-            // --- ICMP Echo Reply ---
-            if (ip_hdr->ip_p == ip_protocol_icmp) {
-                // Locate ICMP header
-                uint8_t* icmp_buf = packet.data()
-                    + sizeof(sr_ethernet_hdr_t)
-                    + ip_hdr->ip_hl * 4;
-                auto *icmp_hdr = reinterpret_cast<sr_icmp_hdr_t*>(icmp_buf);
-
-                // Echo request? type=8, code=0
-                if (icmp_hdr->icmp_type == 8 && icmp_hdr->icmp_code == 0) {
-                    // 1) swap Ethernet MACs
-                    mac_addr tmp_mac;
-                    std::memcpy(tmp_mac.data(), eth_hdr->ether_shost, ETHER_ADDR_LEN);
-                    std::memcpy(eth_hdr->ether_shost, eth_hdr->ether_dhost, ETHER_ADDR_LEN);
-                    std::memcpy(eth_hdr->ether_dhost, tmp_mac.data(),       ETHER_ADDR_LEN);
-
-                    // 2) swap IPs
-                    uint32_t tmp_ip = ip_hdr->ip_src;
-                    ip_hdr->ip_src = ip_hdr->ip_dst;
-                    ip_hdr->ip_dst = tmp_ip;
-
-                    // 3) reset TTL & IP checksum
-                    ip_hdr->ip_ttl = 64;
-                    ip_hdr->ip_sum = 0;
-                    ip_hdr->ip_sum = cksum(ip_hdr, ip_hdr->ip_hl * 4);
-
-                    // 4) set ICMP to echo‑reply & recompute checksum
-                    icmp_hdr->icmp_type = 0;
-                    icmp_hdr->icmp_code = 0;
-                    icmp_hdr->icmp_sum  = 0;
-                    int icmp_len = ntohs(ip_hdr->ip_len) - (ip_hdr->ip_hl * 4);
-                    icmp_hdr->icmp_sum = cksum(icmp_hdr, icmp_len);
-
-                    // 5) send back out
+        if (toMe) {
+            // (a) ICMP echo request?
+            if (ip->ip_p == ip_protocol_icmp &&
+                packet.size() >= sizeof(sr_ethernet_hdr_t) +
+                                 sizeof(sr_ip_hdr_t) +
+                                 sizeof(sr_icmp_hdr_t))
+            {
+                auto* icmp = reinterpret_cast<sr_icmp_hdr_t*>(
+                    packet.data() + sizeof(sr_ethernet_hdr_t)
+                                  + sizeof(sr_ip_hdr_t));
+                if (icmp->icmp_type == 8 && icmp->icmp_code == 0) {
+                    // swap MACs
+                    mac_addr tmp;
+                    memcpy(tmp.data(), eth->ether_shost, ETHER_ADDR_LEN);
+                    memcpy(eth->ether_shost, eth->ether_dhost, ETHER_ADDR_LEN);
+                    memcpy(eth->ether_dhost, tmp.data(),         ETHER_ADDR_LEN);
+                    // swap IPs
+                    std::swap(ip->ip_src, ip->ip_dst);
+                    ip->ip_ttl = 64;
+                    ip->ip_sum = 0;
+                    ip->ip_sum = cksum(ip, ip->ip_hl * 4);
+                    // ICMP echo reply
+                    icmp->icmp_type = 0;
+                    icmp->icmp_code = 0;
+                    icmp->icmp_sum  = 0;
+                    int icmp_len = ntohs(ip->ip_len) - (ip->ip_hl * 4);
+                    icmp->icmp_sum = cksum(icmp, icmp_len);
                     packetSender->sendPacket(packet, iface);
                     return;
                 }
             }
-            // --- Port Unreachable for TCP/UDP to us ---
-            if (ip_hdr->ip_p == ip_protocol_tcp || ip_hdr->ip_p == ip_protocol_udp) {
-                spdlog::info("Port unreachable for protocol {}", ip_hdr->ip_p);
-                // (Similar ICMP type3/code3 construction would go here)
+            // (b) TCP/UDP to us -> port unreachable
+            if (ip->ip_p == ip_protocol_tcp || ip->ip_p == ip_protocol_udp) {
+                // build ICMP type3 code3
+                auto ifInfo = routingTable->getRoutingInterface(iface);
+                size_t size = sizeof(sr_ethernet_hdr_t)
+                            + sizeof(sr_ip_hdr_t)
+                            + sizeof(sr_icmp_t3_hdr_t);
+                std::vector<uint8_t> resp(size);
+                auto* reth = reinterpret_cast<sr_ethernet_hdr_t*>(resp.data());
+                auto* ip2  = reinterpret_cast<sr_ip_hdr_t*>(resp.data() + sizeof(sr_ethernet_hdr_t));
+                auto* icmp2= reinterpret_cast<sr_icmp_t3_hdr_t*>(resp.data() + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t));
+                // ETH
+                memcpy(reth->ether_dhost, eth->ether_shost, ETHER_ADDR_LEN);
+                memcpy(reth->ether_shost, ifInfo.mac.data(),   ETHER_ADDR_LEN);
+                reth->ether_type = htons(ethertype_ip);
+                // IP
+                ip2->ip_v   = 4;
+                ip2->ip_hl  = 5;
+                ip2->ip_tos = 0;
+                ip2->ip_len = htons(sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t));
+                ip2->ip_id  = 0;
+                ip2->ip_off = 0;
+                ip2->ip_ttl = 64;
+                ip2->ip_p   = ip_protocol_icmp;
+                ip2->ip_src = htonl(ifInfo.ip);
+                ip2->ip_dst = ip->ip_src;
+                ip2->ip_sum = 0;
+                ip2->ip_sum = cksum(ip2, sizeof(sr_ip_hdr_t));
+                // ICMP type3
+                icmp2->icmp_type = 3;
+                icmp2->icmp_code = 3;
+                icmp2->icmp_sum  = 0;
+                icmp2->unused    = 0;
+                icmp2->next_mtu  = 0;
+                size_t datalen = std::min<size_t>(ICMP_DATA_SIZE,
+                                    ip->ip_hl*4 + 8);
+                memcpy(icmp2->data, ip, datalen);
+                icmp2->icmp_sum = cksum(icmp2, sizeof(sr_icmp_t3_hdr_t));
+                packetSender->sendPacket(resp, iface);
                 return;
             }
             return;
         }
-
-        //
-        // --- Forwarding ---
-        //
-
-        // TTL decrement + check
-        if (--ip_hdr->ip_ttl == 0) {
-            spdlog::error("TTL expired, should send Time Exceeded");
-            // (ICMP type11/code0 would go here)
+        // decrement TTL
+        if (--ip->ip_ttl == 0) {
+            // ICMP Time Exceeded (type11 code0)
+            auto ifInfo = routingTable->getRoutingInterface(iface);
+            size_t size = sizeof(sr_ethernet_hdr_t)
+                        + sizeof(sr_ip_hdr_t)
+                        + sizeof(sr_icmp_t3_hdr_t);
+            std::vector<uint8_t> resp(size);
+            auto* reth = reinterpret_cast<sr_ethernet_hdr_t*>(resp.data());
+            auto* ip2  = reinterpret_cast<sr_ip_hdr_t*>(resp.data()+sizeof(sr_ethernet_hdr_t));
+            auto* icmp2= reinterpret_cast<sr_icmp_t3_hdr_t*>(resp.data()+sizeof(sr_ethernet_hdr_t)+sizeof(sr_ip_hdr_t));
+            // ETH
+            memcpy(reth->ether_dhost, eth->ether_shost, ETHER_ADDR_LEN);
+            memcpy(reth->ether_shost, ifInfo.mac.data(),   ETHER_ADDR_LEN);
+            reth->ether_type = htons(ethertype_ip);
+            // IP
+            ip2->ip_v   = 4;
+            ip2->ip_hl  = 5;
+            ip2->ip_tos = 0;
+            ip2->ip_len = htons(sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t));
+            ip2->ip_id  = 0;
+            ip2->ip_off = 0;
+            ip2->ip_ttl = 64;
+            ip2->ip_p   = ip_protocol_icmp;
+            ip2->ip_src = htonl(ifInfo.ip);
+            ip2->ip_dst = ip->ip_src;
+            ip2->ip_sum = 0;
+            ip2->ip_sum = cksum(ip2, sizeof(sr_ip_hdr_t));
+            // ICMP type11
+            icmp2->icmp_type = 11;
+            icmp2->icmp_code = 0;
+            icmp2->icmp_sum  = 0;
+            icmp2->unused    = 0;
+            icmp2->next_mtu  = 0;
+            size_t datalen2 = std::min<size_t>(ICMP_DATA_SIZE,
+                                  ip->ip_hl*4 + 8);
+            memcpy(icmp2->data, ip, datalen2);
+            icmp2->icmp_sum = cksum(icmp2, sizeof(sr_icmp_t3_hdr_t));
+            packetSender->sendPacket(resp, iface);
             return;
         }
-        ip_hdr->ip_sum = 0;
-        ip_hdr->ip_sum = cksum(ip_hdr, ip_hdr->ip_hl * 4);
-
-        // Longest‐prefix match
-        auto routeOpt = routingTable->getRoutingEntry(ip_hdr->ip_dst);
-        if (!routeOpt) {
-            spdlog::error("No route to {}", ntohl(ip_hdr->ip_dst));
-            // (ICMP type3/code0 would go here)
+        ip->ip_sum = 0;
+        ip->ip_sum = cksum(ip, ip->ip_hl * 4);
+        // routing lookup
+        auto entryOpt = routingTable->getRoutingEntry(ip->ip_dst);
+        if (!entryOpt) {
+            // Destination network unreachable (type3 code0)
+            auto ifInfo = routingTable->getRoutingInterface(iface);
+            size_t size = sizeof(sr_ethernet_hdr_t)
+                        + sizeof(sr_ip_hdr_t)
+                        + sizeof(sr_icmp_t3_hdr_t);
+            std::vector<uint8_t> resp(size);
+            auto* reth = reinterpret_cast<sr_ethernet_hdr_t*>(resp.data());
+            auto* ip2  = reinterpret_cast<sr_ip_hdr_t*>(resp.data()+sizeof(sr_ethernet_hdr_t));
+            auto* icmp2= reinterpret_cast<sr_icmp_t3_hdr_t*>(resp.data()+sizeof(sr_ethernet_hdr_t)+sizeof(sr_ip_hdr_t));
+            memcpy(reth->ether_dhost, eth->ether_shost, ETHER_ADDR_LEN);
+            memcpy(reth->ether_shost, ifInfo.mac.data(),   ETHER_ADDR_LEN);
+            reth->ether_type = htons(ethertype_ip);
+            ip2->ip_v   = 4; ip2->ip_hl = 5; ip2->ip_tos=0;
+            ip2->ip_len = htons(sizeof(sr_ip_hdr_t)+sizeof(sr_icmp_t3_hdr_t));
+            ip2->ip_id  = 0; ip2->ip_off=0; ip2->ip_ttl=64;
+            ip2->ip_p   = ip_protocol_icmp;
+            ip2->ip_src = htonl(ifInfo.ip);
+            ip2->ip_dst = ip->ip_src;
+            ip2->ip_sum=0; ip2->ip_sum = cksum(ip2, sizeof(sr_ip_hdr_t));
+            icmp2->icmp_type=3; icmp2->icmp_code=0;
+            icmp2->icmp_sum=0; icmp2->unused=0; icmp2->next_mtu=0;
+            size_t datalen3 = std::min<size_t>(ICMP_DATA_SIZE,
+                                  ip->ip_hl*4 + 8);
+            memcpy(icmp2->data, ip, datalen3);
+            icmp2->icmp_sum = cksum(icmp2, sizeof(sr_icmp_t3_hdr_t));
+            packetSender->sendPacket(resp, iface);
             return;
         }
-        auto route = *routeOpt;
-        uint32_t nextHop = route.gateway ? route.gateway : ip_hdr->ip_dst;
-
-        // ARP lookup
+        auto entry = *entryOpt;
+        uint32_t nextHop = entry.gateway ? entry.gateway : ip->ip_dst;
         auto macOpt = arpCache->getEntry(nextHop);
         if (!macOpt) {
-            spdlog::info("Queueing packet for ARP resolution of {}", ntohl(nextHop));
-            arpCache->queuePacket(nextHop, packet, route.iface);
+            arpCache->queuePacket(nextHop, packet, entry.iface);
             return;
         }
-        mac_addr nh_mac = *macOpt;
-
-        // Rewrite Ethernet header
-        std::memcpy(eth_hdr->ether_dhost, nh_mac.data(), ETHER_ADDR_LEN);
-        auto outInfo = routingTable->getRoutingInterface(route.iface);
-        std::memcpy(eth_hdr->ether_shost, outInfo.mac.data(), ETHER_ADDR_LEN);
-
-        packetSender->sendPacket(packet, route.iface);
-        spdlog::info("Forwarded packet via {}", route.iface);
+        auto nh_mac = *macOpt;
+        memcpy(eth->ether_dhost, nh_mac.data(), ETHER_ADDR_LEN);
+        auto outIf = routingTable->getRoutingInterface(entry.iface);
+        memcpy(eth->ether_shost, outIf.mac.data(), ETHER_ADDR_LEN);
+        packetSender->sendPacket(packet, entry.iface);
+        spdlog::info("Forwarded packet via {}", entry.iface);
         return;
     }
-
-    spdlog::error("Unsupported ethertype: {}", etherType);
+    spdlog::error("Unsupported EtherType: 0x{:04x}", ethtype);
 }
