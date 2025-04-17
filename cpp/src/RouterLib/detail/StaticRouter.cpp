@@ -31,50 +31,51 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
     // --- ARP Handling ---
     //
     if (etherType == ethertype_arp) {
-        auto *arp_hdr = reinterpret_cast<sr_arp_hdr_t*>(
-            packet.data() + sizeof(sr_ethernet_hdr_t));
-
+        auto *arp_hdr = reinterpret_cast<sr_arp_hdr_t*>(packet.data() + sizeof(sr_ethernet_hdr_t));
         uint16_t op  = ntohs(arp_hdr->ar_op);
         uint32_t sip = ntohl(arp_hdr->ar_sip);
         uint32_t tip = ntohl(arp_hdr->ar_tip);
 
-        // Our interface info for this ingress port
-        auto ifInfo = routingTable->getRoutingInterface(iface);
+        // Loop over all router interfaces so we answer requests to any of our IPs (e.g., 10.0.1.1)
+        for (auto const& [ifName, ifInfo] : routingTable->getRoutingInterfaces()) {
+            if (op == arp_op_request && tip == ifInfo.ip) {
+                // Build ARP reply
+                std::vector<uint8_t> reply(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
+                auto *reth = reinterpret_cast<sr_ethernet_hdr_t*>(reply.data());
+                auto *rarp = reinterpret_cast<sr_arp_hdr_t*>(reply.data() + sizeof(sr_ethernet_hdr_t));
 
-        // ARP Request for one of our IPs → send reply
-        if (op == arp_op_request && tip == ifInfo.ip) {
-            // Build ARP reply
-            std::vector<uint8_t> reply(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
-            auto *reth = reinterpret_cast<sr_ethernet_hdr_t*>(reply.data());
-            auto *rarp = reinterpret_cast<sr_arp_hdr_t*>(reply.data() + sizeof(sr_ethernet_hdr_t));
+                // Ethernet header: swap src/dst, set type
+                std::memcpy(reth->ether_dhost, eth_hdr->ether_shost, ETHER_ADDR_LEN);
+                std::memcpy(reth->ether_shost, ifInfo.mac.data(),  ETHER_ADDR_LEN);
+                reth->ether_type = htons(ethertype_arp);
 
-            // Ethernet header: swap src/dst, set type
-            std::memcpy(reth->ether_dhost, eth_hdr->ether_shost, ETHER_ADDR_LEN);
-            std::memcpy(reth->ether_shost, ifInfo.mac.data(),  ETHER_ADDR_LEN);
-            reth->ether_type = htons(ethertype_arp);
+                // ARP header
+                rarp->ar_hrd = htons(arp_hrd_ethernet);
+                rarp->ar_pro = htons(ethertype_ip);
+                rarp->ar_hln = ETHER_ADDR_LEN;
+                rarp->ar_pln = 4;
+                rarp->ar_op  = htons(arp_op_reply);
 
-            // ARP header
-            rarp->ar_hrd = htons(arp_hrd_ethernet);
-            rarp->ar_pro = htons(ethertype_ip);
-            rarp->ar_hln = ETHER_ADDR_LEN;
-            rarp->ar_pln = sizeof(uint32_t);
-            rarp->ar_op  = htons(arp_op_reply);
+                // Our MAC/IP as sender
+                std::memcpy(rarp->ar_sha, ifInfo.mac.data(), ETHER_ADDR_LEN);
+                rarp->ar_sip = htonl(ifInfo.ip);
+                // Original requester as target
+                std::memcpy(rarp->ar_tha, arp_hdr->ar_sha, ETHER_ADDR_LEN);
+                rarp->ar_tip = htonl(sip);
 
-            std::memcpy(rarp->ar_sha, ifInfo.mac.data(),            ETHER_ADDR_LEN);
-            rarp->ar_sip = htonl(ifInfo.ip);
-            std::memcpy(rarp->ar_tha, arp_hdr->ar_sha,              ETHER_ADDR_LEN);
-            rarp->ar_tip = arp_hdr->ar_sip;
-
-            packetSender->sendPacket(reply, iface);
-            return;
+                packetSender->sendPacket(reply, iface);
+                return;
+            }
         }
-        // ARP Reply → learn and drain queue
-        else if (op == arp_op_reply) {
+
+        // ARP Reply: learn the mapping and wake any queued packets
+        if (op == arp_op_reply) {
             mac_addr mac;
             std::memcpy(mac.data(), arp_hdr->ar_sha, ETHER_ADDR_LEN);
             arpCache->addEntry(ntohl(arp_hdr->ar_sip), mac);
             return;
         }
+
         return;
     }
 
