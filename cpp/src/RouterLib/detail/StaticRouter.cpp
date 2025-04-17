@@ -65,13 +65,49 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
             }
         }
         if (destinedForRouter) {
-            // Handle ICMP echo requests or TCP/UDP packets to router interfaces.
-            // For example, if ip_hdr->ip_p == ip_protocol_icmp, then generate an echo reply.
-            // For TCP/UDP, generate ICMP port unreachable.
-            spdlog::info("Packet destined for router itself.");
-            // Implementation for generating ICMP responses goes here.
+            if (ip_hdr->ip_p == ip_protocol_icmp) {
+                // pointer to ICMP header + data
+                uint8_t* icmp_buf = packet.data() 
+                                 + sizeof(sr_ethernet_hdr_t)
+                                 + ip_hdr->ip_hl * 4;
+                sr_icmp_hdr_t* icmp_hdr = reinterpret_cast<sr_icmp_hdr_t*>(icmp_buf);
+        
+                // only handle echo requests (type 8, code 0)
+                if (icmp_hdr->icmp_type == 8 && icmp_hdr->icmp_code == 0) {
+                    // 1) swap Ethernet addresses
+                    mac_addr tmp_mac;
+                    memcpy(tmp_mac.data(), eth_hdr->ether_shost, ETHER_ADDR_LEN);
+                    memcpy(eth_hdr->ether_shost, eth_hdr->ether_dhost, ETHER_ADDR_LEN);
+                    memcpy(eth_hdr->ether_dhost, tmp_mac.data(), ETHER_ADDR_LEN);
+        
+                    // 2) swap IP addresses
+                    uint32_t tmp_ip = ip_hdr->ip_src;
+                    ip_hdr->ip_src = ip_hdr->ip_dst;
+                    ip_hdr->ip_dst = tmp_ip;
+        
+                    // 3) set TTL and recompute IP checksum
+                    ip_hdr->ip_ttl = 64;
+                    ip_hdr->ip_sum = 0;
+                    ip_hdr->ip_sum = cksum(ip_hdr, ip_hdr->ip_hl * 4);
+        
+                    // 4) change ICMP to echo‑reply (type 0) and zero checksum
+                    icmp_hdr->icmp_type = 0;
+                    icmp_hdr->icmp_code = 0;
+                    icmp_hdr->icmp_sum = 0;
+        
+                    // compute ICMP checksum over the entire ICMP payload
+                    int icmp_len = ntohs(ip_hdr->ip_len) - (ip_hdr->ip_hl * 4);
+                    icmp_hdr->icmp_sum = cksum(icmp_hdr, icmp_len);
+        
+                    // 5) send it back out
+                    packetSender->sendPacket(packet, iface);
+                    return;
+                }
+            }
+            // (optionally handle TCP/UDP port‑unreachable here)
             return;
         }
+        
         
         // --- Forwarding the IP Packet ---
         // Decrement TTL and check for expiration
