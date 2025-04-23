@@ -18,13 +18,12 @@ static Packet buildArpRequest(uint32_t target_ip,
                               const std::string& iface,
                               std::shared_ptr<IRoutingTable> routingTable) {
     auto ifInfo = routingTable->getRoutingInterface(iface);
-
     Packet pkt(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t), 0);
     auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pkt.data());
     auto* arp = reinterpret_cast<sr_arp_hdr_t*>(pkt.data() + sizeof(sr_ethernet_hdr_t));
 
-    // Ethernet header: broadcast destination, our source
-    memset(eth->ether_dhost, 0xff, ETHER_ADDR_LEN); // Ensure broadcast
+    // Ethernet header - broadcast destination
+    memset(eth->ether_dhost, 0xff, ETHER_ADDR_LEN);
     memcpy(eth->ether_shost, ifInfo.mac.data(), ETHER_ADDR_LEN);
     eth->ether_type = htons(ethertype_arp);
 
@@ -43,10 +42,10 @@ static Packet buildArpRequest(uint32_t target_ip,
 }
 
 ArpCache::ArpCache(std::chrono::milliseconds entryTimeout,
-                   std::chrono::milliseconds tickInterval,
-                   std::chrono::milliseconds resendInterval,
-                   std::shared_ptr<IPacketSender> packetSender,
-                   std::shared_ptr<IRoutingTable> routingTable)
+                 std::chrono::milliseconds tickInterval,
+                 std::chrono::milliseconds resendInterval,
+                 std::shared_ptr<IPacketSender> packetSender,
+                 std::shared_ptr<IRoutingTable> routingTable)
   : entryTimeout(entryTimeout)
   , tickInterval(tickInterval)
   , resendInterval(resendInterval)
@@ -65,63 +64,69 @@ void ArpCache::tick() {
     std::unique_lock lock(mutex);
     auto now = std::chrono::steady_clock::now();
 
-    // Retransmit unresolved ARP requests
+    // Process each unresolved ARP entry with queued packets
     for (auto& [ip, entry] : entries) {
         if (!entry.resolved && !entry.pendingPackets.empty()) {
             if (now - entry.lastRequestTime >= resendInterval) {
                 if (entry.sentRequests < 7) {
-                    // resend ARP
-                    const auto& [_, outIface] = entry.pendingPackets.front();
-                    Packet req = buildArpRequest(ip, outIface, routingTable);
-                    packetSender->sendPacket(req, outIface);
+                    // Resend ARP request using the outIface from the first queued packet.
+                    auto& pend = entry.pendingPackets.front();
+                    Packet req = buildArpRequest(ip, pend.outIface, routingTable);
+                    packetSender->sendPacket(req, pend.outIface);
                     entry.sentRequests++;
                     entry.lastRequestTime = now;
                 } else {
-                    // After 7 failures, send ICMP Host Unreachable for each queued packet
-                    for (auto& [pkt, outIface] : entry.pendingPackets) {
-                        spdlog::error("ARP failed for IP {} after 7 tries, sending ICMP Host Unreachable", ip);
-
-                        size_t respSize = sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t);
-                        Packet resp(respSize, 0);
-                        auto* origEth = reinterpret_cast<sr_ethernet_hdr_t*>(pkt.data());
-                        auto* origIp  = reinterpret_cast<sr_ip_hdr_t*>(pkt.data() + sizeof(sr_ethernet_hdr_t));
-
-                        auto* reth  = reinterpret_cast<sr_ethernet_hdr_t*>(resp.data());
-                        auto* ip2   = reinterpret_cast<sr_ip_hdr_t*>(resp.data() + sizeof(sr_ethernet_hdr_t));
-                        auto* icmp2 = reinterpret_cast<sr_icmp_t3_hdr_t*>(
-                                         resp.data() + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t));
-
-                        // Ethernet: dst = original src, src = our interface
-                        auto ifaceInfo = routingTable->getRoutingInterface(outIface);
-                        memcpy(reth->ether_dhost, origEth->ether_shost, ETHER_ADDR_LEN);
-                        memcpy(reth->ether_shost, ifaceInfo.mac.data(), ETHER_ADDR_LEN);
-                        reth->ether_type = htons(ethertype_ip);
-
-                        // IP header
-                        ip2->ip_v   = 4;
-                        ip2->ip_hl  = 5;
-                        ip2->ip_tos = 0;
-                        ip2->ip_len = htons(sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t));
-                        ip2->ip_id  = 0;
-                        ip2->ip_off = 0;
-                        ip2->ip_ttl = 32;
-                        ip2->ip_p   = ip_protocol_icmp;
-                        ip2->ip_src = ifaceInfo.ip;
-                        ip2->ip_dst = origIp->ip_src;
-                        ip2->ip_sum = 0;
-                        ip2->ip_sum = cksum(ip2, sizeof(sr_ip_hdr_t));
-
-                        // ICMP Host Unreachable
-                        icmp2->icmp_type = 3;
-                        icmp2->icmp_code = 1;
-                        icmp2->icmp_sum  = 0;
-                        icmp2->unused    = 0;
-                        icmp2->next_mtu  = 0;
-                        size_t dataLen  = std::min<size_t>(ICMP_DATA_SIZE, origIp->ip_hl * 4 + 8);
-                        memcpy(icmp2->data, origIp, dataLen);
-                        icmp2->icmp_sum = cksum(icmp2, sizeof(sr_icmp_t3_hdr_t));
-
-                        packetSender->sendPacket(resp, outIface); // Use the stored interface
+                    // For each pending packet, send a separate ICMP Destination Unreachable message.
+                    for (auto& pend : entry.pendingPackets) {
+                        // Retrieve the interface information for the incoming packet.
+                        auto ifInfo = routingTable->getRoutingInterface(pend.inIface);
+                        size_t icmp_hdr_size = 8;  // Expected ICMP header length: 8 bytes.
+                        size_t respSize = sizeof(sr_ethernet_hdr_t)
+                                          + sizeof(sr_ip_hdr_t)
+                                          + icmp_hdr_size;
+                        std::vector<uint8_t> resp(respSize, 0);
+                        
+                        // Build Ethernet header.
+                        auto* rEth = reinterpret_cast<sr_ethernet_hdr_t*>(resp.data());
+                        // Use the original packet's source MAC as destination.
+                        const auto* origEth = reinterpret_cast<const sr_ethernet_hdr_t*>(pend.pkt.data());
+                        memcpy(rEth->ether_dhost, origEth->ether_shost, ETHER_ADDR_LEN);
+                        memcpy(rEth->ether_shost, ifInfo.mac.data(),   ETHER_ADDR_LEN);
+                        rEth->ether_type = htons(ethertype_ip);
+                        
+                        // Build IP header.
+                        auto* rIp = reinterpret_cast<sr_ip_hdr_t*>(resp.data() + sizeof(sr_ethernet_hdr_t));
+                        // For the unreachable message, the source IP is the device’s IP; the destination is the original packet’s source.
+                        const auto* origIp = reinterpret_cast<const sr_ip_hdr_t*>(pend.pkt.data() + sizeof(sr_ethernet_hdr_t));
+                        rIp->ip_v   = 4;
+                        rIp->ip_hl  = 5;
+                        rIp->ip_tos = 0;
+                        rIp->ip_len = htons(sizeof(sr_ip_hdr_t) + icmp_hdr_size);
+                        rIp->ip_id  = 0;
+                        rIp->ip_off = 0;
+                        rIp->ip_ttl = 32;
+                        rIp->ip_p   = ip_protocol_icmp;
+                        rIp->ip_src = ifInfo.ip;
+                        rIp->ip_dst = origIp->ip_src;
+                        rIp->ip_sum = 0;
+                        rIp->ip_sum = cksum(rIp, sizeof(sr_ip_hdr_t));
+                        
+                        // Build ICMP header.
+                        auto* rIcmp = reinterpret_cast<sr_icmp_t3_hdr_t*>(resp.data() 
+                                                  + sizeof(sr_ethernet_hdr_t)
+                                                  + sizeof(sr_ip_hdr_t));
+                        rIcmp->icmp_type = 3; // Destination Unreachable.
+                        rIcmp->icmp_code = 0; // Net Unreachable.
+                        rIcmp->icmp_sum  = 0;
+                        rIcmp->unused    = 0;
+                        rIcmp->next_mtu  = 0;
+                        // Copy the original IP header + first 8 bytes.
+                        size_t origDataLen = std::min<size_t>(ICMP_DATA_SIZE, static_cast<size_t>(origIp->ip_hl * 4 + 8));
+                        memcpy(rIcmp->data, pend.pkt.data() + sizeof(sr_ethernet_hdr_t), origDataLen);
+                        rIcmp->icmp_sum = cksum(rIcmp, icmp_hdr_size);
+                        
+                        // Send the ICMP unreachable response for this queued packet.
+                        packetSender->sendPacket(resp, pend.inIface);
                     }
                     entry.pendingPackets.clear();
                 }
@@ -129,7 +134,7 @@ void ArpCache::tick() {
         }
     }
 
-    // Expire old entries
+    // Remove expired entries.
     std::erase_if(entries, [&](auto const& kv) {
         return now - kv.second.timeAdded >= entryTimeout;
     });
@@ -145,12 +150,12 @@ void ArpCache::addEntry(uint32_t ip, const mac_addr& mac) {
     entry.sentRequests = 0;
 
     // send any queued packets
-    for (auto& [pkt, outIface] : entry.pendingPackets) {
-        auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pkt.data());
+    for (auto& pend : entry.pendingPackets) {
+        auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pend.pkt.data());
         memcpy(eth->ether_dhost, mac.data(), ETHER_ADDR_LEN);
-        auto outIf = routingTable->getRoutingInterface(outIface);
+        auto outIf = routingTable->getRoutingInterface(pend.outIface);
         memcpy(eth->ether_shost, outIf.mac.data(), ETHER_ADDR_LEN);
-        packetSender->sendPacket(pkt, outIface);
+        packetSender->sendPacket(pend.pkt, pend.outIface);
     }
     entry.pendingPackets.clear();
 }
@@ -164,21 +169,22 @@ std::optional<mac_addr> ArpCache::getEntry(uint32_t ip) {
     return std::nullopt;
 }
 
-void ArpCache::queuePacket(uint32_t ip, const Packet& packet, const std::string& iface) {
+void ArpCache::queuePacket(uint32_t ip, const Packet& packet, 
+                           const std::string& inIface, const std::string& outIface) {
     std::unique_lock lock(mutex);
     auto now = std::chrono::steady_clock::now();
     auto& entry = entries[ip];
     if (entry.pendingPackets.empty() && !entry.resolved) {
-        entry.timeAdded    = now;
+        entry.timeAdded = now;
         entry.sentRequests = 0;
     }
-    entry.pendingPackets.emplace_back(packet, iface);
+    entry.pendingPackets.push_back({packet, inIface, outIface});
 
-    // Immediately send first ARP request
+    // Immediately send initial ARP request if not already sent.
     if (entry.sentRequests == 0) {
-        Packet req = buildArpRequest(ip, iface, routingTable);
-        packetSender->sendPacket(req, iface);
-        entry.sentRequests    = 1;
+        Packet req = buildArpRequest(ip, outIface, routingTable);
+        packetSender->sendPacket(req, outIface);
+        entry.sentRequests = 1;
         entry.lastRequestTime = now;
     }
 }

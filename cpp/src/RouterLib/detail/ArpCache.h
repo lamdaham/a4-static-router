@@ -17,14 +17,20 @@
 // Define Packet as a vector of bytes for convenience
 using Packet = std::vector<uint8_t>;
 
-// Extended ArpEntry definition with all needed fields.
+// New: structure to hold pending packet info
+struct Pending {
+    Packet pkt;
+    std::string inIface;   // the interface that packet came in on
+    std::string outIface;  // the interface used for ARP requests
+};
+
 struct ArpEntry {
     std::chrono::steady_clock::time_point timeAdded;
     bool resolved = false; // Indicates whether this entry is resolved.
-    mac_addr mac; // The MAC address associated with the IP address.
-    // Queue of packets waiting for ARP resolution; each element pairs a packet with the outgoing interface.
-    std::vector<std::pair<Packet, std::string>> pendingPackets;
-    int sentRequests = 0; // Number of ARP request retransmissions.
+    mac_addr mac;          // The MAC address associated with the IP address.
+    // Store pending packets as Pending structs
+    std::vector<Pending> pendingPackets;
+    int sentRequests = 0;  // Number of ARP request retransmissions.
     std::chrono::steady_clock::time_point lastRequestTime; // When the last ARP request was sent.
 };
 
@@ -45,7 +51,11 @@ public:
 
     std::optional<mac_addr> getEntry(uint32_t ip);
 
-    void queuePacket(uint32_t ip, const Packet& packet, const std::string& iface);
+    // New: change queuePacket to accept both inIface and outIface.
+    void queuePacket(uint32_t ip,
+                     const Packet& packet,
+                     const std::string& inIface,
+                     const std::string& outIface);
 
 private:
     void loop();
