@@ -27,7 +27,7 @@ Packet buildArpRequest(uint32_t target_ip,
     const std::string& iface,
     std::shared_ptr<IRoutingTable> routingTable) {
     auto ifInfo = routingTable->getRoutingInterface(iface);  // Declare first
-    spdlog::debug("ARP REQ: Building ARP request for {} on {} (src: {})",
+    spdlog::info("ARP REQ: Building ARP request for {} on {} (src: {})",
                 ip_to_str(target_ip),
                 iface,
                 mac_to_str(ifInfo.mac));
@@ -79,7 +79,7 @@ void ArpCache::tick() {
         if (!entry.resolved && !entry.pendingPackets.empty()) {
             if (now - entry.lastRequestTime >= resendInterval) {
                 if (entry.sentRequests < 7) {
-                    spdlog::debug("ARP RETRY: Resending ARP for {} (attempt {})", ip_to_str(ip),
+                    spdlog::info("ARP RETRY: Resending ARP for {} (attempt {})", ip_to_str(ip),
                      entry.sentRequests+1);
                     auto& pend = entry.pendingPackets.front();
                     Packet req = buildArpRequest(ip, pend.outIface, routingTable);
@@ -87,7 +87,7 @@ void ArpCache::tick() {
                     entry.sentRequests++;
                     entry.lastRequestTime = now;
                 } else {
-                    spdlog::debug("ARP FAIL: Max retries reached for {}, sending ICMP unreachable", ip_to_str(ip));
+                    spdlog::info("ARP FAIL: Max retries reached for {}, sending ICMP unreachable", ip_to_str(ip));
                     for (auto& pend : entry.pendingPackets) {
                         auto ifInfo = routingTable->getRoutingInterface(pend.outIface);
                         size_t respSize = sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + sizeof(minimal_icmp);
@@ -138,7 +138,7 @@ void ArpCache::addEntry(uint32_t ip, const mac_addr& mac) {
     auto now = std::chrono::steady_clock::now();
     auto& entry = entries[ip];
     
-    spdlog::debug("ARP LEARNED: Resolved {} -> {}, sending {} queued packets",
+    spdlog::info("ARP LEARNED: Resolved {} -> {}, sending {} queued packets",
                 ip_to_str(ip),
                 mac_to_str(mac),
                 entry.pendingPackets.size());
