@@ -44,6 +44,8 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
 
         if (op == arp_op_request && tip == ifInfo.ip) {
             // Build ARP reply
+            spdlog::info("ARP REQUEST: Received ARP request for our IP {} on {}", 
+                ip_to_str(tip), iface);
             std::vector<uint8_t> reply(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t), 0);
             auto* reth = reinterpret_cast<sr_ethernet_hdr_t*>(reply.data());
             auto* rarp = reinterpret_cast<sr_arp_hdr_t*>(reply.data() + sizeof(sr_ethernet_hdr_t));
@@ -67,6 +69,10 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
             packetSender->sendPacket(reply, iface);
         }
         else if (op == arp_op_reply  &&  arp->ar_tip == ifInfo.ip) {
+            spdlog::info("ARP REPLY: Learned {} -> {} on interface {}",
+                ip_to_str(arp->ar_sip),
+                mac_to_str(make_mac_addr(arp->ar_sha)),
+                iface);
             mac_addr mac;
             memcpy(mac.data(), arp->ar_sha, ETHER_ADDR_LEN);
             arpCache->addEntry(arp->ar_sip, mac);
@@ -321,6 +327,10 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
         auto macOpt = arpCache->getEntry(nextHop);
         // In the route lookup section where we handle missing ARP entries
         if (!macOpt) {
+            spdlog::info("QUEUEING: No ARP entry for {}, queueing packet ({} bytes) on {}",
+                 ip_to_str(nextHop), 
+                 packet.size(),
+                 route.iface);
             // Only queue the packet - ArpCache will handle sending the ARP request
             arpCache->queuePacket(nextHop, packet, iface, route.iface);
             return;

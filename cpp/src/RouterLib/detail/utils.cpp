@@ -177,3 +177,16 @@ void print_hdrs(uint8_t* buf, uint32_t length) {
     spdlog::error("Unrecognized Ethernet Type: {}", ethtype);
   }
 }
+
+std::string ip_to_str(uint32_t ip) {
+  char buf[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &ip, buf, INET_ADDRSTRLEN);
+  return std::string(buf);
+}
+
+std::string mac_to_str(const mac_addr& mac) {
+    char buf[18];
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return std::string(buf);
+}

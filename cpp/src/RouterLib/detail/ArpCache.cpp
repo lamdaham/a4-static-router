@@ -12,6 +12,8 @@
 #include "IRoutingTable.h"
 #include "IPacketSender.h"
 
+#include "spdlog/spdlog.h"
+
 using Packet = std::vector<uint8_t>;
 
 struct minimal_icmp {
@@ -24,7 +26,12 @@ struct minimal_icmp {
 Packet buildArpRequest(uint32_t target_ip,
     const std::string& iface,
     std::shared_ptr<IRoutingTable> routingTable) {
-    auto ifInfo = routingTable->getRoutingInterface(iface);
+    auto ifInfo = routingTable->getRoutingInterface(iface);  // Declare first
+    spdlog::debug("ARP REQ: Building ARP request for {} on {} (src: {})",
+                ip_to_str(target_ip),
+                iface,
+                mac_to_str(ifInfo.mac));
+    
     Packet pkt(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t), 0);
     auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pkt.data());
     auto* arp = reinterpret_cast<sr_arp_hdr_t*>(pkt.data() + sizeof(sr_ethernet_hdr_t));
@@ -45,7 +52,6 @@ Packet buildArpRequest(uint32_t target_ip,
 
     return pkt;
 }
-
 ArpCache::ArpCache(std::chrono::milliseconds entryTimeout,
                  std::chrono::milliseconds tickInterval,
                  std::chrono::milliseconds resendInterval,
@@ -73,12 +79,15 @@ void ArpCache::tick() {
         if (!entry.resolved && !entry.pendingPackets.empty()) {
             if (now - entry.lastRequestTime >= resendInterval) {
                 if (entry.sentRequests < 7) {
+                    spdlog::debug("ARP RETRY: Resending ARP for {} (attempt {})", ip_to_str(ip),
+                     entry.sentRequests+1);
                     auto& pend = entry.pendingPackets.front();
                     Packet req = buildArpRequest(ip, pend.outIface, routingTable);
                     packetSender->sendPacket(req, pend.outIface);
                     entry.sentRequests++;
                     entry.lastRequestTime = now;
                 } else {
+                    spdlog::debug("ARP FAIL: Max retries reached for {}, sending ICMP unreachable", ip_to_str(ip));
                     for (auto& pend : entry.pendingPackets) {
                         auto ifInfo = routingTable->getRoutingInterface(pend.outIface);
                         size_t respSize = sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + sizeof(minimal_icmp);
@@ -128,6 +137,12 @@ void ArpCache::addEntry(uint32_t ip, const mac_addr& mac) {
     std::unique_lock lock(mutex);
     auto now = std::chrono::steady_clock::now();
     auto& entry = entries[ip];
+    
+    spdlog::debug("ARP LEARNED: Resolved {} -> {}, sending {} queued packets",
+                ip_to_str(ip),
+                mac_to_str(mac),
+                entry.pendingPackets.size());
+
     entry.timeAdded    = now;
     entry.resolved     = true;
     entry.mac          = mac;
@@ -136,7 +151,7 @@ void ArpCache::addEntry(uint32_t ip, const mac_addr& mac) {
     // send any queued packets
     for (auto& pend : entry.pendingPackets) {
         auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pend.pkt.data());
-        memcpy(eth->ether_dhost, mac.data(), ETHER_ADDR_LEN);  // Use resolved MAC
+        memcpy(eth->ether_dhost, mac.data(), ETHER_ADDR_LEN);
         auto outIf = routingTable->getRoutingInterface(pend.outIface);
         memcpy(eth->ether_shost, outIf.mac.data(), ETHER_ADDR_LEN);
         packetSender->sendPacket(pend.pkt, pend.outIface);
