@@ -73,9 +73,15 @@ void StaticRouter::handlePacket(std::vector<uint8_t> packet, std::string iface) 
                 ip_to_str(arp->ar_sip),
                 mac_to_str(make_mac_addr(arp->ar_sha)),
                 iface);
-            mac_addr mac;
-            memcpy(mac.data(), arp->ar_sha, ETHER_ADDR_LEN);
-            arpCache->addEntry(arp->ar_sip, mac);
+            uint32_t sender_ip = arp->ar_sip;
+            mac_addr sender_mac;
+            memcpy(sender_mac.data(), arp->ar_sha, ETHER_ADDR_LEN);
+            
+            // Add to ARP cache
+            arpCache->addEntry(sender_ip, sender_mac);
+            
+            // Send queued packets
+            arpCache->sendQueuedPackets(sender_ip);
         }
         return;
     }

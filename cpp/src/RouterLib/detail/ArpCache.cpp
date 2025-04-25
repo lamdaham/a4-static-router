@@ -26,15 +26,19 @@ struct minimal_icmp {
 Packet buildArpRequest(uint32_t target_ip,
     const std::string& iface,
     std::shared_ptr<IRoutingTable> routingTable) {
-    auto ifInfo = routingTable->getRoutingInterface(iface);  // Declare first
-    spdlog::info("ARP REQ: Building ARP request for {} on {} (src: {})",
-                ip_to_str(target_ip),
-                iface,
-                mac_to_str(ifInfo.mac));
-    
+    auto ifInfo = routingTable->getRoutingInterface(iface);
+    if (!ifInfo.ip) {
+        spdlog::error("No IP configured for interface {}", iface);
+        return {};
+    }
+
     Packet pkt(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t), 0);
     auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pkt.data());
     auto* arp = reinterpret_cast<sr_arp_hdr_t*>(pkt.data() + sizeof(sr_ethernet_hdr_t));
+
+    // Validate broadcast MAC
+    uint8_t broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    memcpy(eth->ether_dhost, broadcast, ETHER_ADDR_LEN);
 
     memset(eth->ether_dhost, 0xFF, ETHER_ADDR_LEN);
     memcpy(eth->ether_shost, ifInfo.mac.data(), ETHER_ADDR_LEN);
@@ -138,25 +142,15 @@ void ArpCache::addEntry(uint32_t ip, const mac_addr& mac) {
     auto now = std::chrono::steady_clock::now();
     auto& entry = entries[ip];
     
-    spdlog::info("ARP LEARNED: Resolved {} -> {}, sending {} queued packets",
-                ip_to_str(ip),
-                mac_to_str(mac),
-                entry.pendingPackets.size());
+    spdlog::info("ARP LEARNED: Resolved {} -> {}", ip_to_str(ip), mac_to_str(mac));
 
-    entry.timeAdded    = now;
-    entry.resolved     = true;
-    entry.mac          = mac;
+    entry.timeAdded = now;
+    entry.resolved = true;
+    entry.mac = mac;
     entry.sentRequests = 0;
 
-    // send any queued packets
-    for (auto& pend : entry.pendingPackets) {
-        auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pend.pkt.data());
-        memcpy(eth->ether_dhost, mac.data(), ETHER_ADDR_LEN);
-        auto outIf = routingTable->getRoutingInterface(pend.outIface);
-        memcpy(eth->ether_shost, outIf.mac.data(), ETHER_ADDR_LEN);
-        packetSender->sendPacket(pend.pkt, pend.outIface);
-    }
-    entry.pendingPackets.clear();
+    // Send queued packets
+    sendQueuedPackets(ip);  // This will handle the locking
 }
 
 std::optional<mac_addr> ArpCache::getEntry(uint32_t ip) {
@@ -193,4 +187,28 @@ void ArpCache::loop() {
         tick();
         std::this_thread::sleep_for(tickInterval);
     }
+}
+
+void ArpCache::sendQueuedPackets(uint32_t ip) {
+    std::unique_lock lock(mutex);
+    auto it = entries.find(ip);
+    if (it == entries.end() || !it->second.resolved) return;
+
+    auto& entry = it->second;
+    spdlog::info("Sending {} queued packets for {}", entry.pendingPackets.size(), ip_to_str(ip));
+
+    for (auto& pend : entry.pendingPackets) {
+        // Update Ethernet header with resolved MAC
+        auto* eth = reinterpret_cast<sr_ethernet_hdr_t*>(pend.pkt.data());
+        memcpy(eth->ether_dhost, entry.mac.data(), ETHER_ADDR_LEN);
+        
+        // Set source MAC to outgoing interface's MAC
+        auto outIf = routingTable->getRoutingInterface(pend.outIface);
+        memcpy(eth->ether_shost, outIf.mac.data(), ETHER_ADDR_LEN);
+        
+        // Send the packet
+        packetSender->sendPacket(pend.pkt, pend.outIface);
+    }
+    
+    entry.pendingPackets.clear();
 }

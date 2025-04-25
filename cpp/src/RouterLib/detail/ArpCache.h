@@ -49,6 +49,8 @@ public:
 
     void addEntry(uint32_t ip, const mac_addr& mac);
 
+    void sendQueuedPackets(uint32_t ip);
+
     std::optional<mac_addr> getEntry(uint32_t ip);
 
     // New: change queuePacket to accept both inIface and outIface.
